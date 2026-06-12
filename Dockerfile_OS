@@ -1,5 +1,5 @@
 FROM cms-images-sz-registry-vpc.cn-shenzhen.cr.aliyuncs.com/os/python:3.13.11
-ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 WORKDIR  /root
 COPY  pyproject.toml  /root/
 RUN pip3 install uv
