@@ -1,0 +1,6 @@
+include:
+  - project: 'ci-base/ci-runner'
+    ref: py-ci
+    file: '/py-ci.yaml'
+variables:
+  dingtoken: "8a861cf6d56ad9a7f7b65c679eda522307763fa0ad96852cb132bb7e8bb0f6c1"
