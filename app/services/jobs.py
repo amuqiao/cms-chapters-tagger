@@ -1,7 +1,9 @@
+import ipaddress
 import uuid
 from typing import Any
 from urllib.parse import urlparse
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppError, NotFoundAppError, ValidationAppError
@@ -76,6 +78,14 @@ def _validate_prompt(job_type: str, prompt_payload: dict[str, Any]) -> None:
             )
 
 
+def _is_private_host(hostname: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified
+    except ValueError:
+        return False
+
+
 def _validate_create_request(payload: CreateJobRequest) -> None:
     if not get_template(payload.job_type):
         raise ValidationAppError("INVALID_JOB_TYPE", f"不支持的 job_type: {payload.job_type}")
@@ -83,14 +93,16 @@ def _validate_create_request(payload: CreateJobRequest) -> None:
         raise ValidationAppError("MODEL_NOT_AVAILABLE", f"模型不可用: {payload.model_id}")
     _validate_prompt(payload.job_type, payload.prompt.model_dump())
     parsed_callback = urlparse(payload.callback.url)
-    if parsed_callback.scheme != "https":
-        local_insecure = (
-            settings.ALLOW_INSECURE_CALLBACKS
-            and parsed_callback.scheme == "http"
-            and parsed_callback.hostname in {"127.0.0.1", "localhost"}
-        )
-        if not local_insecure:
-            raise ValidationAppError("INVALID_INPUT", "callback.url must be HTTPS")
+    hostname = parsed_callback.hostname or ""
+    is_allowed_local = (
+        settings.ALLOW_INSECURE_CALLBACKS
+        and parsed_callback.scheme == "http"
+        and hostname in {"127.0.0.1", "localhost"}
+    )
+    if parsed_callback.scheme != "https" and not is_allowed_local:
+        raise ValidationAppError("INVALID_INPUT", "callback.url must be HTTPS")
+    if not is_allowed_local and _is_private_host(hostname):
+        raise ValidationAppError("INVALID_INPUT", "callback.url must not target private network addresses")
 
 
 async def create_job(db: AsyncSession, payload: CreateJobRequest, caller_id: str) -> tuple[AIJob, bool]:
@@ -103,14 +115,19 @@ async def create_job(db: AsyncSession, payload: CreateJobRequest, caller_id: str
         if existing:
             return existing, False
 
-    active = await JobRepo.count_active_jobs(db)
-    if active >= settings.MAX_ACTIVE_JOBS:
-        raise AppError(
-            "QUEUE_FULL",
-            "服务当前繁忙，请稍后重试",
-            status_code=503,
-            details={"active_jobs": active, "limit": settings.MAX_ACTIVE_JOBS},
-        )
+    if settings.MAX_ACTIVE_JOBS > 0:
+        await db.execute(text("SELECT pg_advisory_lock(hashtext('max_active_jobs_gate'))"))
+        try:
+            active = await JobRepo.count_active_jobs(db)
+        finally:
+            await db.execute(text("SELECT pg_advisory_unlock(hashtext('max_active_jobs_gate'))"))
+        if active >= settings.MAX_ACTIVE_JOBS:
+            raise AppError(
+                "QUEUE_FULL",
+                "服务当前繁忙，请稍后重试",
+                status_code=503,
+                details={"active_jobs": active, "limit": settings.MAX_ACTIVE_JOBS},
+            )
 
     job = await JobRepo.create(
         db,
