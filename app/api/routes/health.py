@@ -5,8 +5,8 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.infrastructure.config import settings
-from app.infrastructure.database import engine
+from app.core.config import settings
+from app.core.database import engine
 
 router = APIRouter(tags=["health"])
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "service": "novel-localization-ai", "version": "1.0.0"}
+    return {"status": "ok", "service": settings.SERVICE_NAME, "version": "1.0.0"}
 
 
 @router.get("/healthz", include_in_schema=False)
@@ -32,13 +32,13 @@ async def healthz():
         ok = False
 
     try:
-        import urllib.parse as _up
-        parsed = _up.urlparse(settings.REDIS_URL)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 6379
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=2)
-        writer.close()
-        await writer.wait_closed()
+        from redis.asyncio import Redis
+
+        redis = Redis.from_url(settings.REDIS_URL, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            await asyncio.wait_for(redis.ping(), timeout=2)
+        finally:
+            await redis.aclose()
         checks["redis"] = "ok"
     except Exception as exc:
         logger.warning("health_check_redis_failed error=%s", exc)

@@ -10,17 +10,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.api.routes import health, jobs, meta
+from app.api.routes import health, jobs, meta, mock_interfaces
 from app.core.exceptions import AppError
 from app.core.logging import configure_logging, set_request_id
-from app.infrastructure.config import settings
+from app.core.config import settings
+from app.workflows.register import register_all_workflows
+
+register_all_workflows()
 
 configure_logging()
 
 logger = logging.getLogger(__name__)
-logger.info("app_start service=novel-localization-ai version=0.1.0")
+logger.info("app_start service=%s version=0.1.0", settings.SERVICE_NAME)
 
-app = FastAPI(title="Novel Localization AI Service", version="0.1.0")
+app = FastAPI(title=settings.SERVICE_TITLE, version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,7 +91,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     )
 
 
-API_PREFIX = "/api/v1/novel-localization-ai"
+API_PREFIX = settings.SERVICE_API_PREFIX
 app.include_router(health.router)
 app.include_router(meta.router, prefix=API_PREFIX)
 app.include_router(jobs.router, prefix=API_PREFIX)
+app.include_router(mock_interfaces.router)

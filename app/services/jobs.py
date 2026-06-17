@@ -1,4 +1,6 @@
+import hashlib
 import ipaddress
+import json
 import uuid
 from typing import Any
 from urllib.parse import urlparse
@@ -7,17 +9,17 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppError, NotFoundAppError, ValidationAppError
-from app.infrastructure.config import settings
-from app.infrastructure.model_registry import get_enabled_model
-from app.infrastructure.prompt_templates import get_template
-from app.infrastructure.storage import sha256_digest, storage
+from app.core.config import settings
+from app.core.model_registry import get_enabled_model
+from app.core.prompt_templates import get_template
+from app.integrations.storage import sha256_digest, storage
 from app.models.job import AIJob
 from app.repositories.job_repo import JobRepo
 from app.schemas.jobs import CreateJobRequest, JobResult, JobStatusResponse
 
 
 def _status_url(job_id: uuid.UUID) -> str:
-    return f"/api/v1/novel-localization-ai/jobs/{job_id}"
+    return f"{settings.SERVICE_API_PREFIX}/jobs/{job_id}"
 
 
 def _configured_oss_bucket() -> str:
@@ -39,15 +41,39 @@ def _job_output_payload(job_id: uuid.UUID) -> dict[str, str]:
     }
 
 
+def _request_fingerprint(payload: CreateJobRequest, job_params: dict[str, Any]) -> str:
+    body = {
+        "job_type": payload.job_type,
+        "job_params": job_params,
+        "callback": payload.callback.model_dump() if payload.callback else None,
+        "metadata": payload.metadata,
+        "options": payload.options.model_dump() if payload.options else None,
+    }
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def _job_to_response(job: AIJob) -> JobStatusResponse:
+    input_payload = job.input_payload or {}
     return JobStatusResponse(
         job_id=job.id,
+        client_request_id=job.client_request_id,
         job_type=job.job_type,
         status=job.status,
-        progress_percent=job.progress_percent,
-        progress_text=job.progress_text,
+        progress={
+            "percent": job.progress_percent,
+            "message": job.progress_text,
+            "stage": None,
+        },
         result=job.result_payload,
         error=job.error_payload,
+        callback={
+            "status": job.callback_status,
+            "attempts": job.callback_attempts,
+            "next_retry_at": job.callback_next_retry_at,
+            "last_error": job.callback_last_error,
+        },
+        metadata=input_payload.get("metadata") or {},
         created_at=job.created_at,
         started_at=job.started_at,
         finished_at=job.finished_at,
@@ -86,13 +112,28 @@ def _is_private_host(hostname: str) -> bool:
         return False
 
 
-def _validate_create_request(payload: CreateJobRequest) -> None:
-    if not get_template(payload.job_type):
-        raise ValidationAppError("INVALID_JOB_TYPE", f"不支持的 job_type: {payload.job_type}")
-    if not get_enabled_model(payload.model_id):
-        raise ValidationAppError("MODEL_NOT_AVAILABLE", f"模型不可用: {payload.model_id}")
-    _validate_prompt(payload.job_type, payload.prompt.model_dump())
-    parsed_callback = urlparse(payload.callback.url)
+def _normalize_job_params(payload: CreateJobRequest, handler: Any) -> dict[str, Any]:
+    try:
+        params = handler.normalize_job_params(payload.job_params)
+    except Exception as exc:
+        raise ValidationAppError(
+            "INVALID_INPUT",
+            "job_params does not match job_type schema",
+            {"job_type": payload.job_type},
+        ) from exc
+    if not isinstance(params, dict):
+        raise ValidationAppError(
+            "INVALID_INPUT",
+            "job_params normalizer must return an object",
+            {"job_type": payload.job_type},
+        )
+    return params
+
+
+def _validate_callback(callback: Any) -> None:
+    if callback is None:
+        return
+    parsed_callback = urlparse(callback.url)
     hostname = parsed_callback.hostname or ""
     is_allowed_local = (
         settings.ALLOW_INSECURE_CALLBACKS
@@ -105,14 +146,51 @@ def _validate_create_request(payload: CreateJobRequest) -> None:
         raise ValidationAppError("INVALID_INPUT", "callback.url must not target private network addresses")
 
 
+def _validate_create_request(payload: CreateJobRequest) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    from app.core import workflow_registry
+    try:
+        handler = workflow_registry.get(payload.job_type)
+    except KeyError:
+        raise ValidationAppError("INVALID_JOB_TYPE", f"不支持的 job_type: {payload.job_type}")
+    job_params = _normalize_job_params(payload, handler)
+    try:
+        runtime_fields = handler.runtime_job_fields(job_params)
+    except NotImplementedError as exc:
+        raise ValidationAppError(
+            "INVALID_JOB_TYPE",
+            f"job_type 缺少运行时适配: {payload.job_type}",
+        ) from exc
+    model_id = runtime_fields.get("model_id")
+    if model_id and not get_enabled_model(model_id):
+        raise ValidationAppError("MODEL_NOT_AVAILABLE", f"模型不可用: {model_id}")
+    # Validate prompt blocks against YAML template if available
+    template = get_template(payload.job_type)
+    if template:
+        prompt_payload = runtime_fields.get("prompt_payload")
+        if not isinstance(prompt_payload, dict):
+            raise ValidationAppError("INVALID_INPUT", "job_type runtime fields must include prompt_payload")
+        _validate_prompt(payload.job_type, prompt_payload)
+    _validate_callback(payload.callback)
+    return handler, job_params, runtime_fields
+
+
 async def create_job(db: AsyncSession, payload: CreateJobRequest, caller_id: str) -> tuple[AIJob, bool]:
-    _validate_create_request(payload)
+    _handler, job_params, runtime_fields = _validate_create_request(payload)
+    request_fingerprint = _request_fingerprint(payload, job_params)
     if payload.client_request_id:
         await JobRepo.advisory_lock_for_client_request(db, caller_id, payload.client_request_id)
         existing = await JobRepo.get_recent_by_client_request(
             db, caller_id=caller_id, client_request_id=payload.client_request_id
         )
         if existing:
+            existing_fingerprint = (existing.input_payload or {}).get("request_fingerprint")
+            if existing_fingerprint is not None and existing_fingerprint != request_fingerprint:
+                raise AppError(
+                    "CLIENT_REQUEST_ID_CONFLICT",
+                    "client_request_id already used with a different request payload",
+                    status_code=409,
+                    details={"job_id": str(existing.id)},
+                )
             return existing, False
 
     if settings.MAX_ACTIVE_JOBS > 0:
@@ -129,16 +207,22 @@ async def create_job(db: AsyncSession, payload: CreateJobRequest, caller_id: str
                 details={"active_jobs": active, "limit": settings.MAX_ACTIVE_JOBS},
             )
 
+    input_payload_data = {
+        "job_params": job_params,
+        "request_fingerprint": request_fingerprint,
+        "metadata": payload.metadata,
+        "options": payload.options.model_dump() if payload.options else None,
+    }
     job = await JobRepo.create(
         db,
         caller_id=caller_id,
         client_request_id=payload.client_request_id,
         job_type=payload.job_type,
-        model_id=payload.model_id,
-        input_payload=payload.source.model_dump(),
+        model_id=runtime_fields.get("model_id"),
+        input_payload=input_payload_data,
         output_payload=_job_output_payload(uuid.uuid4()),
-        callback_payload=payload.callback.model_dump(),
-        prompt_payload=payload.prompt.model_dump(),
+        callback_payload=payload.callback.model_dump() if payload.callback else {},
+        prompt_payload=runtime_fields.get("prompt_payload") or {},
     )
     job.output_payload = _job_output_payload(job.id)
     await db.flush()
@@ -152,13 +236,18 @@ async def get_job_or_404(db: AsyncSession, job_id: uuid.UUID) -> AIJob:
     return job
 
 
-async def get_job_response(db: AsyncSession, job_id: uuid.UUID) -> JobStatusResponse:
-    return _job_to_response(await get_job_or_404(db, job_id))
+async def get_job_response(db: AsyncSession, job_id: uuid.UUID, caller_id: str) -> JobStatusResponse:
+    job = await JobRepo.get_for_caller(db, job_id, caller_id)
+    if not job:
+        raise NotFoundAppError("JOB_NOT_FOUND", f"job_id 不存在: {job_id}")
+    return _job_to_response(job)
 
 
 def create_job_response(job: AIJob) -> dict[str, Any]:
     return {
         "job_id": job.id,
+        "client_request_id": job.client_request_id,
+        "job_type": job.job_type,
         "status": job.status,
         "status_url": _status_url(job.id),
         "created_at": job.created_at,
@@ -166,14 +255,20 @@ def create_job_response(job: AIJob) -> dict[str, Any]:
 
 
 def _load_input_text(job: AIJob) -> str:
-    input_payload = job.input_payload
-    oss_payload = input_payload.get("oss") or input_payload
+    input_payload = (job.input_payload or {}).get("job_params") or job.input_payload
+
+    # Inline source: text stored directly
+    source_payload = input_payload.get("source") or input_payload
+    if source_payload.get("inline"):
+        return source_payload["inline"]["text"]
+
+    oss_payload = source_payload.get("oss") or source_payload
 
     try:
         text = storage.read_text(
-            bucket=input_payload.get("oss_bucket") or _configured_oss_bucket(),
+            bucket=source_payload.get("oss_bucket") or _configured_oss_bucket(),
             key=oss_payload["oss_key"],
-            region=input_payload.get("oss_region") or _configured_oss_region(),
+            region=source_payload.get("oss_region") or _configured_oss_region(),
         )
     except AppError:
         raise
@@ -191,17 +286,19 @@ def _load_input_text(job: AIJob) -> str:
 
 def _artifact_key(job: AIJob, artifact_key: str) -> str:
     prefix = job.output_payload["oss_prefix"].strip("/")
-    filename = {
-        "localized_text": "localized.txt",
-        "translated_text": "translated.txt",
-    }.get(artifact_key, f"{artifact_key}.txt")
+    filename = f"{artifact_key}.txt"
     return f"{prefix}/{filename}" if prefix else filename
 
 
 def _persist_large_artifacts(job: AIJob, result: JobResult) -> dict[str, Any]:
+    from app.core import workflow_registry
+    try:
+        persist_keys = workflow_registry.get(job.job_type).large_artifact_keys
+    except KeyError:
+        persist_keys = frozenset()
     result_data = result.model_dump()
     for artifact in result_data["artifacts"]:
-        if artifact["key"] not in {"localized_text", "translated_text"}:
+        if artifact["key"] not in persist_keys:
             continue
         content = artifact.pop("content", None)
         if content is None:

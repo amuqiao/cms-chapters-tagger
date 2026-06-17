@@ -18,9 +18,9 @@
 - 包管理：`uv`
 - 本地依赖服务：`docker compose`
 
-## 部署模式
+## 运行与部署模式
 
-本项目维护 3 种部署模式：
+本项目区分 1 个本地运行入口和 2 个 compose 部署入口：
 
 - `local`：宿主机运行 API/worker，`docker compose` 只提供 PostgreSQL/Redis；入口是 `./scripts/dev.sh`。
 - `compose-deps`：只启动 PostgreSQL/Redis 依赖服务；入口是 `./scripts/deploy.sh up compose-deps`。
@@ -54,11 +54,11 @@
 ./scripts/dev.sh bootstrap
 ./scripts/dev.sh start
 ./scripts/dev.sh status
-./scripts/dev.sh smoke
-./scripts/dev.sh workflow-smoke
-./scripts/dev.sh e2e
-./scripts/dev.sh check
 ./scripts/dev.sh stop
+./scripts/verify.sh smoke
+./scripts/verify.sh workflow-smoke
+./scripts/verify.sh e2e
+./scripts/verify.sh check
 ./scripts/deploy.sh check
 ```
 
@@ -70,29 +70,29 @@
 ./scripts/dev.sh status api
 ```
 
-不要绕过 `scripts/dev.sh` 直接拼散命令，除非是在排查脚本本身。
+不要绕过 `scripts/dev.sh` 直接拼散本地服务命令，除非是在排查脚本本身。一次性验证任务使用 `scripts/verify.sh`。
 
 ## 验证要求
 
 修改代码后，优先运行：
 
 ```bash
-./scripts/dev.sh check
+./scripts/verify.sh check
 ```
 
 修改服务启动、任务执行、数据库迁移、对象存储或 Job 流程后，还应运行：
 
 ```bash
 ./scripts/dev.sh start
-./scripts/dev.sh smoke
+./scripts/verify.sh smoke
 ./scripts/dev.sh stop
 ```
 
-修改 Job 内部执行、Celery workflow、分块或 merge 后，优先运行可重复的 mock 长文本验证：
+修改 Job 内部执行、Celery workflow、分块或 merge 后，优先运行可重复的长文本验证：
 
 ```bash
 ./scripts/dev.sh start
-./scripts/dev.sh workflow-smoke
+./scripts/verify.sh workflow-smoke
 ./scripts/dev.sh stop
 ```
 
@@ -100,7 +100,7 @@
 
 ```bash
 ./scripts/dev.sh start
-./scripts/dev.sh e2e
+./scripts/verify.sh e2e
 ./scripts/dev.sh stop
 ```
 
@@ -121,6 +121,14 @@
 - `scripts/dev.sh` 会拒绝明显非本地的 `DATABASE_URL` 和 `REDIS_URL`。
 - 不要在本仓库脚本中加入生产部署、远程数据库重置、密钥写入或跨仓库清理逻辑。
 
+## 配置面规则
+
+- 配置项只暴露稳定控制意图，不暴露底层实现细节或派生结果。
+- `.env.example` 只放生产或本地常用的安全旋钮；高级参数默认留在 `Settings`，内部不变量使用模块常量。
+- 有联动关系的值必须由代码派生，并在启动时做 fail-fast 校验。
+- 新增或暴露配置项前，必须确认真实生效、默认值合理、非法值会报错、安全边界不会被 silent fallback 绕过。
+- 修改配置项时必须同步检查 `app/core/config.py`、`.env.example`、部署文档和相关测试。
+
 ## 代码修改规则
 
 - 先读现有结构，再做小范围修改。
@@ -135,17 +143,11 @@
 - 命令、路径、配置键、协议名、接口路径、类名和包名保留英文原文。
 - README 只写稳定入口和必要背景；临时排查记录不要写入 README。
 
-# Git 规则
+  # Git 规则
 
-- 提交应尽量保持单一意图，不把多个无关改动混在同一个提交中。
-- 如果改动跨多个主题，先拆分，再提交。
-- 仓库已有提交规范时，优先遵守仓库规范；若无明确规范，优先使用 Conventional Commits。
-- 无明确规范时，可优先使用 `docs:`、`feat:`、`fix:`、`refactor:`、`chore:` 等类型前缀表达主题。
-- 提交信息默认使用中文；如果使用 Conventional Commits，类型前缀可保留英文，描述部分默认使用中文。
-- 不要积攒过大的杂糅提交；完成一个独立改动后及时提交。
-- 提交前先确认改动范围和提交主题一致。
-- 提交前确认相关入口文档或规则文件已同步更新。
-- 提交信息优先写“改了什么”，再写对象，不写空泛标题。
-- 提交前完成最小必要验证；无法验证时，明确说明原因和剩余风险。
-- 非明确要求下，不做 `amend`，不改写历史。
-- 不为了凑提交而拆出没有独立意义的碎提交。
+  - 提交必须保持单一意图，不混入无关改动；跨主题改动应拆分提交。
+  - 提交前确认改动范围、提交主题、入口文档或规则文件同步情况。
+  - 提交前完成最小必要验证；无法验证时说明原因和剩余风险。
+  - 提交信息默认使用中文；无仓库规范时优先使用 Conventional Commits，例如 `docs:`、`feat:`、`fix:`、`refactor:`、`chore:`。
+  - 提交信息优先写“改了什么”和对象，不写空泛标题。
+  - 只在用户明确要求时提交；非明确要求下不做 `amend`，不改写历史。
