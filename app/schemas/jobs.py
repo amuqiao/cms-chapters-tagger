@@ -36,8 +36,21 @@ class OSSReference(StrictBaseModel):
         return "text/plain; charset=utf-8"
 
 
+class JobSourceInline(StrictBaseModel):
+    text: str = Field(min_length=1)
+
+
 class JobSource(StrictBaseModel):
-    oss: OSSReference
+    oss: OSSReference | None = None
+    inline: JobSourceInline | None = None
+
+    @model_validator(mode="after")
+    def validate_source(self):
+        if self.oss is None and self.inline is None:
+            raise ValueError("JobSource must have either 'oss' or 'inline'")
+        if self.oss is not None and self.inline is not None:
+            raise ValueError("JobSource cannot have both 'oss' and 'inline'")
+        return self
 
 
 class CallbackConfig(StrictBaseModel):
@@ -61,17 +74,31 @@ class PromptConfig(StrictBaseModel):
     blocks: list[PromptBlock] = Field(min_length=1)
 
 
+class JobOptions(StrictBaseModel):
+    priority: Literal["low", "normal", "high"] = "normal"
+    timeout_seconds: int | None = Field(default=None, gt=0)
+
+
 class CreateJobRequest(StrictBaseModel):
     client_request_id: str | None = Field(default=None, max_length=255)
     job_type: str = Field(min_length=1)
+    job_params: dict[str, Any] = Field(default_factory=dict)
+    callback: CallbackConfig | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    options: JobOptions | None = None
+
+
+class NovelLocalizationJobParams(StrictBaseModel):
     model_id: str = Field(min_length=1)
     source: JobSource
-    callback: CallbackConfig
     prompt: PromptConfig
+    extra: dict[str, Any] | None = None
 
 
 class CreateJobResponse(StrictBaseModel):
     job_id: UUID
+    client_request_id: str | None = None
+    job_type: str
     status: str
     status_url: str
     created_at: datetime
@@ -102,14 +129,41 @@ class JobError(StrictBaseModel):
     details: dict[str, Any] = {}
 
 
-class JobStatusResponse(StrictBaseModel):
+class JobProgress(StrictBaseModel):
+    percent: int
+    message: str | None = None
+    stage: str | None = None
+
+
+class CallbackDeliveryView(StrictBaseModel):
+    status: str
+    attempts: int
+    next_retry_at: datetime | None = None
+    last_error: dict[str, Any] | None = None
+
+
+class JobView(StrictBaseModel):
     job_id: UUID
+    client_request_id: str | None = None
     job_type: str
     status: str
-    progress_percent: int
-    progress_text: str | None = None
-    result: JobResult | None = None
+    progress: JobProgress
+    result: dict[str, Any] | None = None
     error: JobError | None = None
+    callback: CallbackDeliveryView
+    metadata: dict[str, Any] = {}
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+
+
+class JobStatusResponse(JobView):
+    pass
+
+
+class CallbackEnvelope(StrictBaseModel):
+    event: Literal["job.succeeded", "job.failed"]
+    event_id: UUID
+    attempt: int
+    sent_at: datetime
+    job: JobView
